@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -87,6 +86,9 @@ type Options struct {
 	IndexLess LessFunction
 
 	Compression Compression
+
+	LruSize      int
+	LruIndexPath string
 }
 
 // Diskv implements the Diskv interface. You shouldn't construct Diskv
@@ -96,6 +98,7 @@ type Diskv struct {
 	mu        sync.RWMutex
 	cache     map[string][]byte
 	cacheSize uint64
+	lru       *lru
 }
 
 // New returns an initialized Diskv structure, ready to use.
@@ -136,6 +139,14 @@ func New(o Options) *Diskv {
 
 	if d.Index != nil && d.IndexLess != nil {
 		d.Index.Initialize(d.IndexLess, d.Keys(nil))
+	}
+
+	if o.LruSize > 0 {
+		d.lru = newLru(o.LruSize, d.eraseWithLock)
+		if o.LruIndexPath != "" {
+			d.Index = newLruIndex(o.LruIndexPath)
+			d.lru.Initialize(d.Index.Keys("", 0))
+		}
 	}
 
 	return d
@@ -203,7 +214,7 @@ func (d *Diskv) createKeyFileWithLock(pathKey *PathKey) (*os.File, error) {
 		if err := os.MkdirAll(d.TempDir, d.PathPerm); err != nil {
 			return nil, fmt.Errorf("temp mkdir: %s", err)
 		}
-		f, err := ioutil.TempFile(d.TempDir, "")
+		f, err := os.CreateTemp(d.TempDir, "")
 		if err != nil {
 			return nil, fmt.Errorf("temp file: %s", err)
 		}
@@ -281,6 +292,12 @@ func (d *Diskv) writeStreamWithLock(pathKey *PathKey, r io.Reader, sync bool) er
 		d.Index.Insert(pathKey.originalKey)
 	}
 
+	if d.lru != nil {
+		if err = d.lru.Add(pathKey.originalKey); err != nil {
+			return fmt.Errorf("lru add: %s", err)
+		}
+	}
+
 	d.bustCacheWithLock(pathKey.originalKey) // cache only on read
 
 	return nil
@@ -341,7 +358,7 @@ func (d *Diskv) Read(key string) ([]byte, error) {
 		return []byte{}, err
 	}
 	defer rc.Close()
-	return ioutil.ReadAll(rc)
+	return io.ReadAll(rc)
 }
 
 // ReadString reads the key and returns a string value
@@ -362,10 +379,17 @@ func (d *Diskv) ReadString(key string) string {
 // If compression is enabled, ReadStream taps into the io.Reader stream prior
 // to decompression, and caches the compressed data.
 func (d *Diskv) ReadStream(key string, direct bool) (io.ReadCloser, error) {
-
 	pathKey := d.transform(key)
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+
+	if d.lru != nil {
+		d.lru.Read(key)
+	}
+
+	if d.Index != nil {
+		d.Index.Insert(key)
+	}
 
 	if val, ok := d.cache[key]; ok {
 		if !direct {
@@ -373,7 +397,7 @@ func (d *Diskv) ReadStream(key string, direct bool) (io.ReadCloser, error) {
 			if d.Compression != nil {
 				return d.Compression.Reader(buf)
 			}
-			return ioutil.NopCloser(buf), nil
+			return io.NopCloser(buf), nil
 		}
 
 		go func() {
@@ -413,7 +437,7 @@ func (d *Diskv) readWithRLock(pathKey *PathKey) (io.ReadCloser, error) {
 		r = &closingReader{f}
 	}
 
-	var rc = io.ReadCloser(ioutil.NopCloser(r))
+	var rc = io.NopCloser(r)
 	if d.Compression != nil {
 		rc, err = d.Compression.Reader(r)
 		if err != nil {
@@ -482,10 +506,13 @@ func (s *siphon) Read(p []byte) (int, error) {
 
 // Erase synchronously erases the given key from the disk and the cache.
 func (d *Diskv) Erase(key string) error {
-	pathKey := d.transform(key)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	return d.eraseWithLock(key)
+}
+
+func (d *Diskv) eraseWithLock(key string) error {
 	d.bustCacheWithLock(key)
 
 	// erase from index
@@ -493,8 +520,12 @@ func (d *Diskv) Erase(key string) error {
 		d.Index.Delete(key)
 	}
 
+	if d.lru != nil {
+		d.lru.Remove(key)
+	}
+
 	// erase from disk
-	filename := d.completeFilename(pathKey)
+	filename := d.completeFilename(d.transform(key))
 	if s, err := os.Stat(filename); err == nil {
 		if s.IsDir() {
 			return errBadKey
@@ -524,7 +555,16 @@ func (d *Diskv) EraseAll() error {
 	if d.TempDir != "" {
 		os.RemoveAll(d.TempDir) // errors ignored
 	}
-	return os.RemoveAll(d.BasePath)
+	if d.lru != nil {
+		d.lru.Purge()
+	}
+	if err := os.RemoveAll(d.BasePath); err != nil {
+		return err
+	}
+	if d.Index != nil {
+		d.Index.Initialize(d.IndexLess, d.Keys(nil))
+	}
+	return nil
 }
 
 // Has returns true if the given key exists.
@@ -547,6 +587,27 @@ func (d *Diskv) Has(key string) bool {
 	}
 
 	return true
+}
+
+func (d *Diskv) Size(key string) int64 {
+	pathKey := d.transform(key)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if val, ok := d.cache[key]; ok {
+		return int64(len(val))
+	}
+
+	filename := d.completeFilename(pathKey)
+	s, err := os.Stat(filename)
+	if err != nil {
+		return -1
+	}
+	if s.IsDir() {
+		return -1
+	}
+
+	return s.Size()
 }
 
 // Keys returns a channel that will yield every key accessible by the store,
