@@ -380,11 +380,14 @@ func (d *Diskv) ReadString(key string) string {
 // to decompression, and caches the compressed data.
 func (d *Diskv) ReadStream(key string, direct bool) (io.ReadCloser, error) {
 	pathKey := d.transform(key)
-	d.mu.RLock()
-	defer d.mu.RUnlock()
 
 	if d.lru != nil {
+		d.mu.Lock()
+		defer d.mu.Unlock()
 		d.lru.Read(key)
+	} else {
+		d.mu.RLock()
+		defer d.mu.RUnlock()
 	}
 
 	if d.Index != nil {

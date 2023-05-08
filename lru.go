@@ -33,7 +33,10 @@ func (c *lru) Add(key string) error {
 		c.items[key] = c.evictList.PushFront(key)
 		if c.evictList.Len() > c.size {
 			if e = c.evictList.Back(); e != nil {
-				return c.fn(e.Value.(string))
+				if v, ok := e.Value.(string); ok {
+					return c.fn(v)
+				}
+				c.evictList.Remove(e)
 			}
 		}
 	}
