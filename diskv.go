@@ -145,7 +145,13 @@ func New(o Options) *Diskv {
 		d.lru = newLru(o.LruSize, d.eraseWithLock)
 		if o.LruIndexPath != "" {
 			d.Index = newLruIndex(o.LruIndexPath)
-			d.lru.Initialize(d.Index.Keys("", 0))
+			for _, key := range d.Index.Keys("", 0) {
+				if !d.Has(key) {
+					d.Index.Delete(key)
+				} else {
+					d.lru.Add(key)
+				}
+			}
 		}
 	}
 
@@ -220,8 +226,8 @@ func (d *Diskv) createKeyFileWithLock(pathKey *PathKey) (*os.File, error) {
 		}
 
 		if err := os.Chmod(f.Name(), d.FilePerm); err != nil {
-			f.Close()           // error deliberately ignored
-			os.Remove(f.Name()) // error deliberately ignored
+			f.Close()                                  // error deliberately ignored
+			d.errRemove(f.Name(), pathKey.originalKey) // error deliberately ignored
 			return nil, fmt.Errorf("chmod: %s", err)
 		}
 		return f, nil
@@ -250,28 +256,28 @@ func (d *Diskv) writeStreamWithLock(pathKey *PathKey, r io.Reader, sync bool) er
 	if d.Compression != nil {
 		wc, err = d.Compression.Writer(f)
 		if err != nil {
-			f.Close()           // error deliberately ignored
-			os.Remove(f.Name()) // error deliberately ignored
+			f.Close()                                  // error deliberately ignored
+			d.errRemove(f.Name(), pathKey.originalKey) // error deliberately ignored
 			return fmt.Errorf("compression writer: %s", err)
 		}
 	}
 
 	if _, err := io.Copy(wc, r); err != nil {
-		f.Close()           // error deliberately ignored
-		os.Remove(f.Name()) // error deliberately ignored
-		return fmt.Errorf("i/o copy: %s", err)
+		f.Close()                                  // error deliberately ignored
+		d.errRemove(f.Name(), pathKey.originalKey) // error deliberately ignored
+		return fmt.Errorf("i/o copy %s: %s", f.Name(), err)
 	}
 
 	if err := wc.Close(); err != nil {
-		f.Close()           // error deliberately ignored
-		os.Remove(f.Name()) // error deliberately ignored
+		f.Close()                                  // error deliberately ignored
+		d.errRemove(f.Name(), pathKey.originalKey) // error deliberately ignored
 		return fmt.Errorf("compression close: %s", err)
 	}
 
 	if sync {
 		if err := f.Sync(); err != nil {
-			f.Close()           // error deliberately ignored
-			os.Remove(f.Name()) // error deliberately ignored
+			f.Close()                                  // error deliberately ignored
+			d.errRemove(f.Name(), pathKey.originalKey) // error deliberately ignored
 			return fmt.Errorf("file sync: %s", err)
 		}
 	}
@@ -283,7 +289,7 @@ func (d *Diskv) writeStreamWithLock(pathKey *PathKey, r io.Reader, sync bool) er
 	fullPath := d.completeFilename(pathKey)
 	if f.Name() != fullPath {
 		if err := os.Rename(f.Name(), fullPath); err != nil {
-			os.Remove(f.Name()) // error deliberately ignored
+			d.errRemove(f.Name(), pathKey.originalKey) // error deliberately ignored
 			return fmt.Errorf("rename: %s", err)
 		}
 	}
@@ -388,10 +394,6 @@ func (d *Diskv) ReadStream(key string, direct bool) (io.ReadCloser, error) {
 	} else {
 		d.mu.RLock()
 		defer d.mu.RUnlock()
-	}
-
-	if d.Index != nil {
-		d.Index.Insert(key)
 	}
 
 	if val, ok := d.cache[key]; ok {
@@ -781,6 +783,18 @@ func (d *Diskv) ensureCacheSpaceWithLock(valueSize uint64) error {
 	}
 
 	return nil
+}
+
+func (d *Diskv) errRemove(file, key string) {
+	if err := os.Remove(file); err == nil {
+		if d.lru != nil {
+			d.lru.Remove(key)
+		}
+
+		if d.Index != nil {
+			d.Index.Delete(key)
+		}
+	}
 }
 
 // nopWriteCloser wraps an io.Writer and provides a no-op Close method to

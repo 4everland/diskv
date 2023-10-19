@@ -20,12 +20,6 @@ func newLru(size int, fn evictFunction) *lru {
 	}
 }
 
-func (c *lru) Initialize(keys []string) {
-	for _, key := range keys {
-		c.Add(key)
-	}
-}
-
 func (c *lru) Add(key string) error {
 	if e, ok := c.items[key]; ok {
 		c.evictList.MoveToFront(e)
